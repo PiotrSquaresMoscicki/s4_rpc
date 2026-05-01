@@ -92,7 +92,10 @@ required — so a single test can directly compare the two.
   and `false` once the queue is drained, so Unreal Engine
   `FAutomationLatentCommand` implementations can write
   `Update() { return !env.tick(); }`. Use `env.idle()` to query the
-  queue without advancing it.
+  queue without advancing it. The `env.parse_and_submit("...")` macro
+  is the queued counterpart of `parse_and_execute` — it parses the
+  literal at compile time, materializes the AST as a `static constexpr`
+  whose lifetime spans the program, and forwards it to `submit()`.
 
 Scripts must outlive their queued execution. The `parse_and_execute`
 macro produces a `static constexpr` AST, which satisfies this
@@ -110,6 +113,16 @@ static constexpr auto ast = rpc_dsl::ParseRpc<R"(
 
 // Tick-driven: one RPC per engine tick.
 env.submit(ast);
+while (env.tick()) {
+    // engine tick happens here
+}
+
+// Equivalently, the parse_and_submit macro inlines the literal:
+env.parse_and_submit(R"(
+    OpenAsset("Map")
+    SelectActor("Player")
+    Translate(10, 0, 0)
+)");
 while (env.tick()) {
     // engine tick happens here
 }
@@ -173,15 +186,14 @@ bool FMyEditorRpcTest::RunTest(const FString& /*Parameters*/) {
     // it, so own it on the heap and capture by reference.
     static rpc_dsl::RpcEnvironment<FMyEditorCtx> Env;
 
-    // ParseRpc<...>() yields a constexpr AST; making it `static
-    // constexpr` keeps it alive for the whole test run.
-    static constexpr auto Ast = rpc_dsl::ParseRpc<R"(
+    // parse_and_submit parses the literal at compile time and queues
+    // the resulting AST; the macro materializes it as a static
+    // constexpr internally so its storage outlives the queue.
+    Env.parse_and_submit(R"(
         OpenAsset("Map")
         SelectActor("Player")
         Translate(10, 0, 0)
-    )">();
-
-    Env.submit(Ast);
+    )");
     ADD_LATENT_AUTOMATION_COMMAND(FTickRpcEnvLatentCommand(Env));
 
     // Assertions about the post-conditions can be enqueued after the
@@ -191,5 +203,6 @@ bool FMyEditorRpcTest::RunTest(const FString& /*Parameters*/) {
 ```
 
 If you instead want the script to run in a single tick (e.g. for fast
-unit-style coverage) call `Env.execute(Ast)` directly inside `RunTest`
-and skip the latent command — the same environment supports both modes.
+unit-style coverage) call `Env.parse_and_execute(R"( ... )")` directly
+inside `RunTest` and skip the latent command — the same environment
+supports both modes.

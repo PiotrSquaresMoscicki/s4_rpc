@@ -182,6 +182,27 @@ TEST_CASE("execute() and submit() coexist on the same environment") {
     CHECK(env.idle() == true);
 }
 
+TEST_CASE("parse_and_submit queues a script for tick-driven execution") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    env.parse_and_submit(R"(
+        Spawn("X", 1)
+        Spawn("Y", 2)
+    )");
+
+    // Like submit(), parse_and_submit only queues — nothing runs yet.
+    CHECK(env.context.calls == 0);
+    CHECK(env.idle() == false);
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "X");
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "Y");
+    CHECK(env.context.calls == 2);
+    CHECK(env.idle() == true);
+}
+
 TEST_CASE("Multiple submitted scripts are drained in order") {
     rpc_dsl::RpcEnvironment<TestContext> env;
 

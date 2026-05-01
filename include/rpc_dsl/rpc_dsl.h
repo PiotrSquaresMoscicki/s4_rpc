@@ -174,6 +174,16 @@ constexpr auto ParseRpc() {
 
 #define parse_and_execute(LITERAL) execute(rpc_dsl::ParseRpc<LITERAL>())
 
+// parse_and_submit mirrors parse_and_execute but enqueues the script for
+// tick-driven execution. Because submit() stores a pointer/size view into
+// the parsed AST, the storage must outlive the queued execution — so the
+// macro materializes the AST as a `static constexpr` local inside an
+// immediately-invoked lambda and forwards it by const reference.
+#define parse_and_submit(LITERAL) submit([]() -> const auto& {              \
+    static constexpr auto _rpc_dsl_ast = rpc_dsl::ParseRpc<LITERAL>();      \
+    return _rpc_dsl_ast;                                                    \
+}())
+
 // --- 4. Runtime Execution Environment ---
 
 using RpcValue = std::variant<int, float, std::string>;
