@@ -9,7 +9,6 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <memory>
 #include <deque>
 
 namespace rpc_dsl {
@@ -218,58 +217,6 @@ struct RpcExecution {
     }
 };
 
-// --- 6. Execution Managers ---
-//
-// IRpcManager owns the policy of *when* commands run. The default
-// ImmediateRpcManager runs scripts synchronously on submit (preserving the
-// original execute() semantics). OneCommandPerTickRpcManager queues scripts
-// and advances exactly one command per tick(), suitable for integration
-// into Unreal Engine FAutomationLatentCommand::Update() loops.
-template <typename Context>
-struct IRpcManager {
-    virtual ~IRpcManager() = default;
-
-    // Hand a script to the manager. The manager decides when to advance it.
-    virtual void submit(RpcExecution<Context> exec) = 0;
-
-    // Advance work by one unit of progress (policy-defined).
-    // Returns true while work *remains pending after this tick*, false once
-    // the manager is idle. This shape lets UE FAutomationLatentCommand
-    // implementations write `Update() { return !env.tick(); }`.
-    virtual bool tick() = 0;
-
-    // True when no pending work remains.
-    virtual bool idle() const = 0;
-};
-
-template <typename Context>
-struct ImmediateRpcManager : IRpcManager<Context> {
-    void submit(RpcExecution<Context> exec) override {
-        exec.run_to_completion();
-    }
-    bool tick() override { return false; }
-    bool idle() const override { return true; }
-};
-
-template <typename Context>
-struct OneCommandPerTickRpcManager : IRpcManager<Context> {
-    std::deque<RpcExecution<Context>> queue;
-
-    void submit(RpcExecution<Context> exec) override {
-        if (!exec.finished()) queue.push_back(std::move(exec));
-    }
-
-    bool tick() override {
-        if (queue.empty()) return false;
-        auto& front = queue.front();
-        if (!front.finished()) front.step();
-        if (front.finished()) queue.pop_front();
-        return !queue.empty();
-    }
-
-    bool idle() const override { return queue.empty(); }
-};
-
 template <typename Context>
 struct RpcEnvironment {
     static_assert(std::is_base_of_v<RpcContext<Context>, Context>, "Context must derive from RpcContext<Context>");
@@ -277,30 +224,19 @@ struct RpcEnvironment {
     Context context;
     std::unordered_map<std::string, RpcValue> variables;
     std::unordered_map<std::string, RpcFunc> registry;
-    std::unique_ptr<IRpcManager<Context>> manager;
 
-    RpcEnvironment()
-        : manager(std::make_unique<ImmediateRpcManager<Context>>()) {
-        context.register_rpc_functions(*this);
-    }
+    // Pending executions driven by tick(). execute() bypasses this queue
+    // and runs synchronously; submit() appends to it for one-command-per-tick
+    // driving (e.g. Unreal Engine FAutomationLatentCommand::Update()).
+    std::deque<RpcExecution<Context>> pending;
+
+    RpcEnvironment() { context.register_rpc_functions(*this); }
 
     void set_context(Context&& ctx) {
         context = std::move(ctx);
         registry.clear();
         context.register_rpc_functions(*this);
     }
-
-    // Inject a custom execution manager. Passing nullptr restores the
-    // default ImmediateRpcManager behavior.
-    void set_manager(std::unique_ptr<IRpcManager<Context>> m) {
-        manager = m ? std::move(m)
-                    : std::unique_ptr<IRpcManager<Context>>(
-                          std::make_unique<ImmediateRpcManager<Context>>());
-    }
-
-    // Pass-through to the active manager so callers (e.g. UE automation
-    // latent commands) don't need to reach through manager directly.
-    bool tick() { return manager->tick(); }
 
     template <typename Ret, typename... Args>
     void bind(const std::string& name, Ret (Context::*func)(Args...)) {
@@ -310,10 +246,45 @@ struct RpcEnvironment {
         };
     }
 
+    // Run a parsed script to completion immediately, in the calling thread.
+    // This is the synchronous, all-at-once mode and preserves the original
+    // execute() behavior. It does not interact with the tick() queue.
     template <size_t N>
     void execute(const ParsedScript<N>& script) {
-        manager->submit(RpcExecution<Context>(this, script.commands.data(), script.commands.size()));
+        RpcExecution<Context>(this, script.commands.data(), script.commands.size())
+            .run_to_completion();
     }
+
+    // Queue a parsed script for tick-driven execution. Nothing runs until
+    // tick() is called. The script's storage must outlive its execution;
+    // ParsedScript<N> produced by the parse_and_execute macro is typically
+    // a `static constexpr`, which satisfies this naturally.
+    template <size_t N>
+    void submit(const ParsedScript<N>& script) {
+        RpcExecution<Context> exec(this, script.commands.data(), script.commands.size());
+        if (!exec.finished()) pending.push_back(std::move(exec));
+    }
+
+    // Advance the queued executions by exactly one command. Returns true
+    // while work remains pending after this tick, false once the queue is
+    // drained — chosen so UE FAutomationLatentCommand::Update() can write
+    // `return !env.tick();`. Exceptions thrown by an RPC propagate out;
+    // the offending execution is dropped from the queue.
+    bool tick() {
+        if (pending.empty()) return false;
+        auto& front = pending.front();
+        try {
+            if (!front.finished()) front.step();
+        } catch (...) {
+            pending.pop_front();
+            throw;
+        }
+        if (front.finished()) pending.pop_front();
+        return !pending.empty();
+    }
+
+    // True when no tick-driven work remains.
+    bool idle() const { return pending.empty(); }
 
     // Executes a single parsed command against this environment. Used by
     // RpcExecution::step(); also safe to call directly.
