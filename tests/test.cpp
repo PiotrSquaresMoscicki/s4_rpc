@@ -1,6 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
-#include "rpc_dsl.h"
+#include "rpc_dsl/rpc_dsl.h"
 
 // --- Mock Context for Testing ---
 
