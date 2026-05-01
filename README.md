@@ -117,3 +117,79 @@ while (env.tick()) {
 // Or synchronous: same script, all in one call.
 env.execute(ast);
 ```
+
+## Unreal Engine simple automation tests
+
+The `submit` / `tick` / `idle` shape is designed to drop straight into a
+UE *simple automation test* (`IMPLEMENT_SIMPLE_AUTOMATION_TEST`). The
+test body cannot block the engine, so any work that needs to span ticks
+is queued through `ADD_LATENT_AUTOMATION_COMMAND` and driven by
+`FAutomationLatentCommand::Update()` — which returns `true` when the
+latent command is finished.
+
+Because `env.tick()` returns `true` *while work remains* and `false`
+once the queue is drained, a latent command can forward to the
+environment with a single line: `return !Env.tick();`.
+
+```cpp
+// MyEditorRpcTest.cpp
+#include "Misc/AutomationTest.h"
+#include "rpc_dsl/rpc_dsl.h"
+
+// 1) Your editor context exposes whatever the script needs to call.
+struct FMyEditorCtx : public rpc_dsl::RpcContext<FMyEditorCtx> {
+    void register_rpc_functions(rpc_dsl::RpcEnvironment<FMyEditorCtx>& Env) override {
+        Env.bind("OpenAsset",   &FMyEditorCtx::OpenAsset);
+        Env.bind("SelectActor", &FMyEditorCtx::SelectActor);
+        Env.bind("Translate",   &FMyEditorCtx::Translate);
+    }
+    void OpenAsset(std::string Name)               { /* ... */ }
+    void SelectActor(std::string Name)             { /* ... */ }
+    void Translate(int X, int Y, int Z)            { /* ... */ }
+};
+
+// 2) A latent command that advances the environment by one RPC per
+//    engine tick. Update() returns true when the command is done, so
+//    we just negate env.tick().
+class FTickRpcEnvLatentCommand : public IAutomationLatentCommand {
+public:
+    explicit FTickRpcEnvLatentCommand(rpc_dsl::RpcEnvironment<FMyEditorCtx>& InEnv)
+        : Env(InEnv) {}
+
+    bool Update() override { return !Env.tick(); }
+
+private:
+    rpc_dsl::RpcEnvironment<FMyEditorCtx>& Env;
+};
+
+// 3) The actual simple automation test.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FMyEditorRpcTest,
+    "MyEditor.Rpc.OpenSelectTranslate",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMyEditorRpcTest::RunTest(const FString& /*Parameters*/) {
+    // The environment must outlive every latent command that references
+    // it, so own it on the heap and capture by reference.
+    static rpc_dsl::RpcEnvironment<FMyEditorCtx> Env;
+
+    // ParseRpc<...>() yields a constexpr AST; making it `static
+    // constexpr` keeps it alive for the whole test run.
+    static constexpr auto Ast = rpc_dsl::ParseRpc<R"(
+        OpenAsset("Map")
+        SelectActor("Player")
+        Translate(10, 0, 0)
+    )">();
+
+    Env.submit(Ast);
+    ADD_LATENT_AUTOMATION_COMMAND(FTickRpcEnvLatentCommand(Env));
+
+    // Assertions about the post-conditions can be enqueued after the
+    // tick-driven script with another latent command.
+    return true;
+}
+```
+
+If you instead want the script to run in a single tick (e.g. for fast
+unit-style coverage) call `Env.execute(Ast)` directly inside `RunTest`
+and skip the latent command — the same environment supports both modes.
