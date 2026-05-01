@@ -9,4 +9,9 @@ FetchContent_MakeAvailable(doctest)
 add_executable(rpc_dsl_test test.cpp)
 target_link_libraries(rpc_dsl_test PRIVATE rpc_dsl doctest::doctest)
 
-add_test(NAME rpc_dsl_test COMMAND rpc_dsl_test)
+# Register each doctest TEST_CASE as a separate ctest test so that ctest
+# reports and runs them individually instead of treating the whole executable
+# as a single test.
+list(APPEND CMAKE_MODULE_PATH ${doctest_SOURCE_DIR}/scripts/cmake)
+include(doctest)
+doctest_discover_tests(rpc_dsl_test)
