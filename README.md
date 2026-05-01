@@ -76,3 +76,46 @@ int main() {
     return 0;
 }
 ```
+
+## Execution managers
+
+`RpcEnvironment` delegates *when* commands run to an injectable
+`IRpcManager<Context>`. This lets the same script be driven either
+synchronously (one big batch) or one command per frame, which is useful
+when testing controllers in MVC-style editors where some events only
+reproduce when commands are split across ticks.
+
+Two built-in managers ship in the header:
+
+- **`ImmediateRpcManager<Context>`** *(default)* — `execute()` runs the
+  whole script synchronously, exactly as before. `env.tick()` is a no-op.
+- **`OneCommandPerTickRpcManager<Context>`** — `execute()` only enqueues
+  the script. Each call to `env.tick()` advances the front script by
+  exactly one command. `tick()` returns `true` while work is pending and
+  `false` once the queue is drained.
+
+Inject a manager via `env.set_manager(...)`; passing `nullptr` restores
+the default. Scripts must outlive their executions — the typical
+`parse_and_execute` macro produces a `static constexpr` AST, which
+satisfies this automatically.
+
+```cpp
+rpc_dsl::RpcEnvironment<MyEditorCtx> env;
+env.set_manager(std::make_unique<
+    rpc_dsl::OneCommandPerTickRpcManager<MyEditorCtx>>());
+
+static constexpr auto ast = rpc_dsl::ParseRpc<R"(
+    OpenAsset("Map")
+    SelectActor("Player")
+    Translate(10, 0, 0)
+)">();
+env.execute(ast); // queued, nothing has run yet
+
+while (env.tick()) {
+    // one RPC command was just executed; engine ticks here
+}
+```
+
+This shape integrates directly with Unreal Engine
+`FAutomationLatentCommand`-style tests: `Update()` simply returns
+`!env.tick();` to step one command per engine tick.

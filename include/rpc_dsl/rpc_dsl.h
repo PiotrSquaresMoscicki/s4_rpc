@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <memory>
+#include <deque>
 
 namespace rpc_dsl {
 
@@ -187,6 +189,87 @@ struct RpcContext {
     virtual void register_rpc_functions(RpcEnvironment<Derived>& env) = 0;
 };
 
+// --- 5. Resumable Script Execution State ---
+//
+// RpcExecution captures the program counter for an in-flight script so it
+// can be advanced one command at a time. It stores the command sequence
+// as a (pointer, size) view; the underlying ParsedScript<N> must outlive
+// the execution. ParsedScript is typically a `static constexpr` produced
+// by the parse_and_execute macro, which satisfies this requirement.
+template <typename Context>
+struct RpcExecution {
+    RpcEnvironment<Context>* env = nullptr;
+    const Command* commands = nullptr;
+    size_t size = 0;
+    size_t pc = 0;
+
+    RpcExecution() = default;
+    RpcExecution(RpcEnvironment<Context>* e, const Command* cmds, size_t n)
+        : env(e), commands(cmds), size(n), pc(0) {}
+
+    bool finished() const { return pc >= size; }
+
+    // Executes exactly one non-empty command, advancing the program counter
+    // past any blank entries. No-op when already finished.
+    void step();
+
+    void run_to_completion() {
+        while (!finished()) step();
+    }
+};
+
+// --- 6. Execution Managers ---
+//
+// IRpcManager owns the policy of *when* commands run. The default
+// ImmediateRpcManager runs scripts synchronously on submit (preserving the
+// original execute() semantics). OneCommandPerTickRpcManager queues scripts
+// and advances exactly one command per tick(), suitable for integration
+// into Unreal Engine FAutomationLatentCommand::Update() loops.
+template <typename Context>
+struct IRpcManager {
+    virtual ~IRpcManager() = default;
+
+    // Hand a script to the manager. The manager decides when to advance it.
+    virtual void submit(RpcExecution<Context> exec) = 0;
+
+    // Advance work by one unit of progress (policy-defined).
+    // Returns true while work *remains pending after this tick*, false once
+    // the manager is idle. This shape lets UE FAutomationLatentCommand
+    // implementations write `Update() { return !env.tick(); }`.
+    virtual bool tick() = 0;
+
+    // True when no pending work remains.
+    virtual bool idle() const = 0;
+};
+
+template <typename Context>
+struct ImmediateRpcManager : IRpcManager<Context> {
+    void submit(RpcExecution<Context> exec) override {
+        exec.run_to_completion();
+    }
+    bool tick() override { return false; }
+    bool idle() const override { return true; }
+};
+
+template <typename Context>
+struct OneCommandPerTickRpcManager : IRpcManager<Context> {
+    std::deque<RpcExecution<Context>> queue;
+
+    void submit(RpcExecution<Context> exec) override {
+        if (!exec.finished()) queue.push_back(std::move(exec));
+    }
+
+    bool tick() override {
+        if (queue.empty()) return false;
+        auto& front = queue.front();
+        if (!front.finished()) front.step();
+        if (front.finished()) queue.pop_front();
+        return !queue.empty();
+    }
+
+    bool idle() const override { return queue.empty(); }
+};
+
 template <typename Context>
 struct RpcEnvironment {
     static_assert(std::is_base_of_v<RpcContext<Context>, Context>, "Context must derive from RpcContext<Context>");
@@ -194,14 +277,30 @@ struct RpcEnvironment {
     Context context;
     std::unordered_map<std::string, RpcValue> variables;
     std::unordered_map<std::string, RpcFunc> registry;
+    std::unique_ptr<IRpcManager<Context>> manager;
 
-    RpcEnvironment() { context.register_rpc_functions(*this); }
+    RpcEnvironment()
+        : manager(std::make_unique<ImmediateRpcManager<Context>>()) {
+        context.register_rpc_functions(*this);
+    }
 
     void set_context(Context&& ctx) {
         context = std::move(ctx);
         registry.clear();
         context.register_rpc_functions(*this);
     }
+
+    // Inject a custom execution manager. Passing nullptr restores the
+    // default ImmediateRpcManager behavior.
+    void set_manager(std::unique_ptr<IRpcManager<Context>> m) {
+        manager = m ? std::move(m)
+                    : std::unique_ptr<IRpcManager<Context>>(
+                          std::make_unique<ImmediateRpcManager<Context>>());
+    }
+
+    // Pass-through to the active manager so callers (e.g. UE automation
+    // latent commands) don't need to reach through manager directly.
+    bool tick() { return manager->tick(); }
 
     template <typename Ret, typename... Args>
     void bind(const std::string& name, Ret (Context::*func)(Args...)) {
@@ -213,29 +312,33 @@ struct RpcEnvironment {
 
     template <size_t N>
     void execute(const ParsedScript<N>& script) {
-        for (const auto& cmd : script.commands) {
-            if (cmd.func_name.empty()) continue;
+        manager->submit(RpcExecution<Context>(this, script.commands.data(), script.commands.size()));
+    }
 
-            auto it = registry.find(std::string(cmd.func_name));
-            if (it == registry.end()) throw std::runtime_error("Unknown function: " + std::string(cmd.func_name));
+    // Executes a single parsed command against this environment. Used by
+    // RpcExecution::step(); also safe to call directly.
+    void execute_command(const Command& cmd) {
+        if (cmd.func_name.empty()) return;
 
-            std::array<RpcValue, 8> resolved_args;
-            for (size_t i = 0; i < cmd.arg_count; ++i) {
-                const auto& arg = cmd.args[i];
-                if (arg.type == ConstexprArg::Type::Int) resolved_args[i] = arg.i_val;
-                else if (arg.type == ConstexprArg::Type::Float) resolved_args[i] = arg.f_val;
-                else if (arg.type == ConstexprArg::Type::String) resolved_args[i] = std::string(arg.str_val);
-                else if (arg.type == ConstexprArg::Type::Variable) {
-                    std::string var_name(arg.str_val);
-                    if (variables.find(var_name) == variables.end()) throw std::runtime_error("Unknown variable: " + var_name);
-                    resolved_args[i] = variables.at(var_name);
-                }
+        auto it = registry.find(std::string(cmd.func_name));
+        if (it == registry.end()) throw std::runtime_error("Unknown function: " + std::string(cmd.func_name));
+
+        std::array<RpcValue, 8> resolved_args;
+        for (size_t i = 0; i < cmd.arg_count; ++i) {
+            const auto& arg = cmd.args[i];
+            if (arg.type == ConstexprArg::Type::Int) resolved_args[i] = arg.i_val;
+            else if (arg.type == ConstexprArg::Type::Float) resolved_args[i] = arg.f_val;
+            else if (arg.type == ConstexprArg::Type::String) resolved_args[i] = std::string(arg.str_val);
+            else if (arg.type == ConstexprArg::Type::Variable) {
+                std::string var_name(arg.str_val);
+                if (variables.find(var_name) == variables.end()) throw std::runtime_error("Unknown variable: " + var_name);
+                resolved_args[i] = variables.at(var_name);
             }
+        }
 
-            RpcValue result = it->second(resolved_args, cmd.arg_count);
-            if (!cmd.assigned_var.empty()) {
-                variables[std::string(cmd.assigned_var)] = result;
-            }
+        RpcValue result = it->second(resolved_args, cmd.arg_count);
+        if (!cmd.assigned_var.empty()) {
+            variables[std::string(cmd.assigned_var)] = result;
         }
     }
 
@@ -259,5 +362,14 @@ private:
         }
     }
 };
+
+// Out-of-line: needs the complete RpcEnvironment type.
+template <typename Context>
+void RpcExecution<Context>::step() {
+    // Skip blank entries that the parser may leave between real commands.
+    while (pc < size && commands[pc].func_name.empty()) ++pc;
+    if (pc >= size) return;
+    env->execute_command(commands[pc++]);
+}
 
 } // namespace rpc_dsl
