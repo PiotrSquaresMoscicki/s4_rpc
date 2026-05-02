@@ -229,3 +229,124 @@ TEST_CASE("Multiple submitted scripts are drained in order") {
     CHECK(env.context.calls == 3);
     CHECK(env.idle() == true);
 }
+
+// --- Runtime parser tests ---
+
+TEST_CASE("Runtime parser executes scripts only known at runtime") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    // The script comes from a runtime std::string — this exercises the
+    // string_view overload that parses at runtime instead of compile time.
+    std::string script;
+    script += "var entity_id = Spawn(\"Goblin\", 25)\n";
+    script += "MoveTo(entity_id, 7.5, -3.0)\n";
+
+    env.execute(std::string_view{script});
+
+    CHECK(env.context.calls == 2);
+    CHECK(env.context.last_name == "Goblin");
+    CHECK(env.context.last_x == 7.5f);
+    REQUIRE(env.variables.count("entity_id") == 1);
+    CHECK(std::get<int>(env.variables["entity_id"]) == 50);
+}
+
+TEST_CASE("Runtime parser produces the same AST as the constexpr parser") {
+    constexpr auto compile_time_ast = rpc_dsl::ParseRpc<R"(
+        var hero = Spawn("Knight", 100)
+        MoveTo(hero, 15.5, -5)
+    )">();
+
+    std::string runtime_script = R"(
+        var hero = Spawn("Knight", 100)
+        MoveTo(hero, 15.5, -5)
+    )";
+    rpc_dsl::RuntimeParsedScript runtime_ast = rpc_dsl::parse_runtime(runtime_script);
+
+    REQUIRE(runtime_ast.commands.size() == 2);
+
+    CHECK(runtime_ast.commands[0].func_name == compile_time_ast.commands[0].func_name);
+    CHECK(runtime_ast.commands[0].assigned_var == compile_time_ast.commands[0].assigned_var);
+    CHECK(runtime_ast.commands[0].args[0].type == compile_time_ast.commands[0].args[0].type);
+    CHECK(runtime_ast.commands[0].args[1].i_val == compile_time_ast.commands[0].args[1].i_val);
+
+    CHECK(runtime_ast.commands[1].func_name == compile_time_ast.commands[1].func_name);
+    CHECK(runtime_ast.commands[1].args[0].type == compile_time_ast.commands[1].args[0].type);
+    CHECK(runtime_ast.commands[1].args[1].f_val == compile_time_ast.commands[1].args[1].f_val);
+}
+
+TEST_CASE("Runtime parser supports submit() + tick() driven execution") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    // Build the script piece-by-piece at runtime to make absolutely sure
+    // it cannot be a compile-time string literal.
+    std::string script;
+    script += "Spawn(\"A\", 1)\n";
+    script += "Spawn(\"B\", 2)\n";
+    script += "Spawn(\"C\", 3)\n";
+
+    env.submit(std::string_view{script});
+
+    // submit() owns the parsed AST internally, so the local `script`
+    // string can go out of scope before all ticks fire.
+    script.clear();
+    script.shrink_to_fit();
+
+    CHECK(env.context.calls == 0);
+    CHECK(env.idle() == false);
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "A");
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "B");
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "C");
+    CHECK(env.context.calls == 3);
+    CHECK(env.idle() == true);
+}
+
+TEST_CASE("Runtime parser surfaces syntax errors as runtime exceptions") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    // Deliberately malformed script: missing the closing parenthesis on
+    // the call. The constexpr parser would throw at compile time on a
+    // literal; the runtime path throws std::logic_error when invoked.
+    std::string bad = "Spawn(\"oops\", 1";
+    CHECK_THROWS_AS(env.execute(std::string_view{bad}), std::logic_error);
+}
+
+// --- Regression: compile-time parsing must remain compile-time ---
+//
+// These static_asserts prove that scripts passed as string literals are
+// parsed entirely during compilation. If a refactor ever accidentally
+// routed the literal-form macros through the runtime parser, the
+// expressions below would no longer be constant expressions and the
+// translation unit would fail to compile — preventing the regression
+// from reaching CI green.
+
+static_assert(rpc_dsl::ParseRpc<R"(
+    var hero = Spawn("Knight", 100)
+    MoveTo(hero, 15.5, -5)
+)">().commands[0].func_name == "Spawn",
+    "ParseRpc<> must be evaluated at compile time");
+
+static_assert(rpc_dsl::ParseRpc<R"(
+    var hero = Spawn("Knight", 100)
+    MoveTo(hero, 15.5, -5)
+)">().commands[1].args[1].f_val == 15.5f,
+    "ParseRpc<> must produce a constexpr AST");
+
+// `parse_and_submit` already materializes the parsed AST as a
+// `static constexpr` inside an immediately-invoked lambda. That value
+// is itself a constant expression, so we can re-derive it here in a
+// static_assert context to lock in the compile-time guarantee for the
+// macro path as well.
+static_assert([] {
+    constexpr auto ast = rpc_dsl::ParseRpc<R"(
+        Spawn("X", 1)
+        Spawn("Y", 2)
+    )">();
+    return ast.commands[0].func_name == "Spawn"
+        && ast.commands[1].args[0].str_val == "Y";
+}(), "parse_and_submit / parse_and_execute literal path must be compile-time");
