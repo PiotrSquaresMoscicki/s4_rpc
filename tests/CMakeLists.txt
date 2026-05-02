@@ -6,7 +6,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(doctest)
 
-add_executable(rpc_dsl_test test.cpp)
+add_executable(rpc_dsl_test test.cpp test_stress_1000.cpp)
 target_link_libraries(rpc_dsl_test PRIVATE rpc_dsl doctest::doctest)
 
 # Register each doctest TEST_CASE as a separate ctest test so that ctest
