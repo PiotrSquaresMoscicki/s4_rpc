@@ -10,6 +10,8 @@
 #include <type_traits>
 #include <utility>
 #include <deque>
+#include <vector>
+#include <memory>
 
 namespace rpc_dsl {
 
@@ -184,6 +186,55 @@ constexpr auto ParseRpc() {
     return _rpc_dsl_ast;                                                    \
 }())
 
+// --- 3b. Runtime Parser ---
+//
+// Mirror of the constexpr parser for cases where the script is only known
+// at runtime (e.g. read from a file or constructed from user input).
+//
+// `parse_line` is already a constexpr function, which means it is also a
+// regular function and can be invoked at runtime. We reuse it verbatim, so
+// the runtime parser produces exactly the same AST as the compile-time
+// parser — the only differences are:
+//   * commands are stored in a `std::vector` (size known only at runtime),
+//   * a copy of the source script is owned by the result, because the
+//     `std::string_view`s inside `Command` reference the source text and
+//     must outlive the AST.
+//
+// `RuntimeParsedScript` is move-only on purpose: copying would invalidate
+// the `string_view`s that point into the owned `source` buffer, and copying
+// the source string would silently double the storage. Move construction
+// keeps the underlying `std::string` stable because we hold it through a
+// `std::unique_ptr<std::string>` — the heap allocation address does not
+// change when the unique_ptr is moved.
+struct RuntimeParsedScript {
+    std::unique_ptr<std::string> source;
+    std::vector<Command> commands;
+
+    RuntimeParsedScript() = default;
+    RuntimeParsedScript(const RuntimeParsedScript&) = delete;
+    RuntimeParsedScript& operator=(const RuntimeParsedScript&) = delete;
+    RuntimeParsedScript(RuntimeParsedScript&&) noexcept = default;
+    RuntimeParsedScript& operator=(RuntimeParsedScript&&) noexcept = default;
+};
+
+inline RuntimeParsedScript parse_runtime(std::string_view script) {
+    RuntimeParsedScript result;
+    result.source = std::make_unique<std::string>(script);
+    std::string_view view(*result.source);
+    size_t start = 0;
+    while (start < view.size()) {
+        size_t end = view.find('\n', start);
+        if (end == std::string_view::npos) end = view.size();
+
+        std::string_view line = trim(view.substr(start, end - start));
+        if (!line.empty()) {
+            result.commands.push_back(parse_line(line));
+        }
+        start = end + 1;
+    }
+    return result;
+}
+
 // --- 4. Runtime Execution Environment ---
 
 using RpcValue = std::variant<int, float, std::string>;
@@ -211,6 +262,14 @@ struct RpcExecution {
     const Command* commands = nullptr;
     size_t size = 0;
     size_t pc = 0;
+
+    // Optional storage for a runtime-parsed script. When the execution
+    // owns a `RuntimeParsedScript` (because it was created from a
+    // `std::string_view` overload), the AST it points to lives here and
+    // is destroyed together with the execution. For the compile-time
+    // path this stays null and `commands` references a `static constexpr`
+    // ParsedScript<N> instead.
+    std::unique_ptr<RuntimeParsedScript> owned_script;
 
     RpcExecution() = default;
     RpcExecution(RpcEnvironment<Context>* e, const Command* cmds, size_t n)
@@ -272,6 +331,32 @@ struct RpcEnvironment {
     template <size_t N>
     void submit(const ParsedScript<N>& script) {
         RpcExecution<Context> exec(this, script.commands.data(), script.commands.size());
+        if (!exec.finished()) pending.push_back(std::move(exec));
+    }
+
+    // --- Runtime-parsed overloads ---
+    //
+    // These mirror the compile-time `execute` / `submit` but accept a
+    // `std::string_view` and parse the script at runtime. They are picked
+    // automatically by overload resolution based on the argument type, so
+    // a caller does not need to know whether the script is a compile-time
+    // literal or a runtime string — the API is invisible in the same way
+    // `constexpr` is: it evaluates at compile time when possible, and at
+    // runtime otherwise.
+    //
+    // The `submit(string_view)` form transfers ownership of the parsed
+    // AST into the queued `RpcExecution`, so the caller does not need to
+    // keep the source string alive.
+    void execute(std::string_view script) {
+        RuntimeParsedScript parsed = parse_runtime(script);
+        RpcExecution<Context>(this, parsed.commands.data(), parsed.commands.size())
+            .run_to_completion();
+    }
+
+    void submit(std::string_view script) {
+        auto owned = std::make_unique<RuntimeParsedScript>(parse_runtime(script));
+        RpcExecution<Context> exec(this, owned->commands.data(), owned->commands.size());
+        exec.owned_script = std::move(owned);
         if (!exec.finished()) pending.push_back(std::move(exec));
     }
 

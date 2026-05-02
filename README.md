@@ -6,9 +6,16 @@ and runtime execution of an imperative, text-based RPC scripting language.
 ## Features
 
 - **Constexpr Parsing**: The script string is parsed entirely during
-  compilation. Syntax errors immediately halt the build.
-- **Zero Runtime AST Allocation**: The Abstract Syntax Tree (AST) is baked
-  directly into the binary as a fixed-size `std::array`.
+  compilation when it is a string literal. Syntax errors immediately halt
+  the build.
+- **Runtime Parsing Fallback**: When the script is only known at runtime
+  (e.g. read from a file or built from user input), the same parser runs
+  at runtime and produces the same AST. The choice is invisible to the
+  caller — like `constexpr`, parsing happens at compile time when
+  possible and at runtime otherwise.
+- **Zero Runtime AST Allocation** *(compile-time path)*: For literal
+  scripts the Abstract Syntax Tree (AST) is baked directly into the
+  binary as a fixed-size `std::array`.
 - **CRTP Context Binding**: Bind standard C++ member functions to the scripting
   environment using clean Curiously Recurring Template Pattern (CRTP)
   interfaces.
@@ -130,6 +137,74 @@ while (env.tick()) {
 // Or synchronous: same script, all in one call.
 env.execute(ast);
 ```
+
+### Appending steps while a script is in flight
+
+`submit()` always appends to the back of the pending queue, so you can
+push more RPC steps onto the environment at any time — between ticks,
+during `execute()`, or even from inside an RPC handler that is itself
+being driven by `tick()`. The in-flight script keeps draining first;
+the appended scripts run after it, in submission order.
+
+```cpp
+env.parse_and_submit(R"(
+    OpenAsset("Map")
+    SelectActor("Player")
+)");
+
+env.tick();                       // OpenAsset runs
+
+// Streaming: more work just arrived. Push it onto the queue —
+// SelectActor still runs next, then the appended commands.
+env.parse_and_submit(R"(
+    Translate(10, 0, 0)
+    Save()
+)");
+
+while (env.tick()) { /* engine tick */ }
+```
+
+The same applies when the appender is an RPC handler reached through
+`tick()` (for example, an `OnAssetLoaded` callback queueing the next
+step). The pending queue is a `std::deque`, whose `push_back` does not
+invalidate references to existing elements, so the in-flight execution
+remains valid for the rest of the current tick.
+
+## Runtime parsing
+
+The same `execute()` and `submit()` entry points also accept a
+`std::string_view`, in which case the script is parsed at runtime. This
+is the right path for scripts that are not known at compile time —
+loaded from disk, received over the network, or assembled from user
+input. The API choice is invisible: pass a compile-time `ParsedScript<N>`
+(typically via the `parse_and_execute` / `parse_and_submit` macros) to
+parse at compile time, or pass a `std::string` / `std::string_view` to
+parse at runtime. Both produce the same AST and behave identically at
+execution time.
+
+```cpp
+rpc_dsl::RpcEnvironment<MyEditorCtx> env;
+
+// Loaded from disk at runtime — parsed at runtime.
+std::string script = read_file("scenario.rpc");
+env.execute(script);            // synchronous
+env.submit(std::string_view{script}); // tick-driven; AST ownership is
+                                      // transferred into the queue, so
+                                      // the source string can go out of
+                                      // scope before all ticks fire.
+```
+
+The runtime parser reuses the same `parse_line` implementation as the
+compile-time parser (it is a `constexpr` function, which means it is
+also a perfectly normal function), so syntax errors are reported the
+same way — they just surface as `std::logic_error` exceptions at runtime
+instead of as build failures.
+
+To avoid accidentally regressing the compile-time path back to runtime
+parsing, the test suite contains `static_assert`s on `ParseRpc<...>()`
+expressions: if a future refactor caused literal scripts to parse at
+runtime, those expressions would no longer be constant expressions and
+the build would fail.
 
 ## Unreal Engine simple automation tests
 
