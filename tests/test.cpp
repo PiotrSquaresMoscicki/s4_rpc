@@ -107,3 +107,125 @@ TEST_CASE("Context Move Semantics") {
     CHECK(env.context.calls == 101); 
     CHECK(env.context.last_name == "Orc");
 }
+
+TEST_CASE("execute() runs scripts immediately (synchronous mode)") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    env.parse_and_execute(R"(
+        Spawn("A", 1)
+        Spawn("B", 2)
+        Spawn("C", 3)
+    )");
+
+    // execute() is the all-at-once mode and ignores the tick queue.
+    CHECK(env.context.calls == 3);
+    CHECK(env.context.last_name == "C");
+    CHECK(env.idle() == true);
+    CHECK(env.tick() == false);
+}
+
+TEST_CASE("submit() + tick() advances exactly one command per tick") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    static constexpr auto ast = rpc_dsl::ParseRpc<R"(
+        Spawn("A", 1)
+        Spawn("B", 2)
+        Spawn("C", 3)
+    )">();
+    env.submit(ast);
+
+    // submit() only queues — nothing has run yet.
+    CHECK(env.context.calls == 0);
+    CHECK(env.idle() == false);
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.calls == 1);
+    CHECK(env.context.last_name == "A");
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.calls == 2);
+    CHECK(env.context.last_name == "B");
+
+    // tick() returns true while work *remains pending after this tick*; on
+    // the final command the queue drains, so the return is false.
+    CHECK(env.tick() == false);
+    CHECK(env.context.calls == 3);
+    CHECK(env.context.last_name == "C");
+    CHECK(env.idle() == true);
+
+    // Further ticks remain idle.
+    CHECK(env.tick() == false);
+    CHECK(env.context.calls == 3);
+}
+
+TEST_CASE("execute() and submit() coexist on the same environment") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    static constexpr auto queued = rpc_dsl::ParseRpc<R"(
+        Spawn("queued", 1)
+    )">();
+    env.submit(queued);
+    CHECK(env.context.calls == 0);
+    CHECK(env.idle() == false);
+
+    // execute() runs synchronously and does not disturb the queue.
+    env.parse_and_execute(R"(
+        Spawn("now", 9)
+    )");
+    CHECK(env.context.calls == 1);
+    CHECK(env.context.last_name == "now");
+    CHECK(env.idle() == false);
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.calls == 2);
+    CHECK(env.context.last_name == "queued");
+    CHECK(env.idle() == true);
+}
+
+TEST_CASE("parse_and_submit queues a script for tick-driven execution") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    env.parse_and_submit(R"(
+        Spawn("X", 1)
+        Spawn("Y", 2)
+    )");
+
+    // Like submit(), parse_and_submit only queues — nothing runs yet.
+    CHECK(env.context.calls == 0);
+    CHECK(env.idle() == false);
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "X");
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "Y");
+    CHECK(env.context.calls == 2);
+    CHECK(env.idle() == true);
+}
+
+TEST_CASE("Multiple submitted scripts are drained in order") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    static constexpr auto ast1 = rpc_dsl::ParseRpc<R"(
+        Spawn("first", 1)
+    )">();
+    static constexpr auto ast2 = rpc_dsl::ParseRpc<R"(
+        Spawn("second", 2)
+        Spawn("third", 3)
+    )">();
+    env.submit(ast1);
+    env.submit(ast2);
+
+    CHECK(env.context.calls == 0);
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "first");
+
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "second");
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "third");
+    CHECK(env.context.calls == 3);
+    CHECK(env.idle() == true);
+}

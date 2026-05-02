@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <deque>
 
 namespace rpc_dsl {
 
@@ -173,6 +174,16 @@ constexpr auto ParseRpc() {
 
 #define parse_and_execute(LITERAL) execute(rpc_dsl::ParseRpc<LITERAL>())
 
+// parse_and_submit mirrors parse_and_execute but enqueues the script for
+// tick-driven execution. Because submit() stores a pointer/size view into
+// the parsed AST, the storage must outlive the queued execution — so the
+// macro materializes the AST as a `static constexpr` local inside an
+// immediately-invoked lambda and forwards it by const reference.
+#define parse_and_submit(LITERAL) submit([]() -> const auto& {              \
+    static constexpr auto _rpc_dsl_ast = rpc_dsl::ParseRpc<LITERAL>();      \
+    return _rpc_dsl_ast;                                                    \
+}())
+
 // --- 4. Runtime Execution Environment ---
 
 using RpcValue = std::variant<int, float, std::string>;
@@ -187,6 +198,35 @@ struct RpcContext {
     virtual void register_rpc_functions(RpcEnvironment<Derived>& env) = 0;
 };
 
+// --- 5. Resumable Script Execution State ---
+//
+// RpcExecution captures the program counter for an in-flight script so it
+// can be advanced one command at a time. It stores the command sequence
+// as a (pointer, size) view; the underlying ParsedScript<N> must outlive
+// the execution. ParsedScript is typically a `static constexpr` produced
+// by the parse_and_execute macro, which satisfies this requirement.
+template <typename Context>
+struct RpcExecution {
+    RpcEnvironment<Context>* env = nullptr;
+    const Command* commands = nullptr;
+    size_t size = 0;
+    size_t pc = 0;
+
+    RpcExecution() = default;
+    RpcExecution(RpcEnvironment<Context>* e, const Command* cmds, size_t n)
+        : env(e), commands(cmds), size(n), pc(0) {}
+
+    bool finished() const { return pc >= size; }
+
+    // Executes exactly one non-empty command, advancing the program counter
+    // past any blank entries. No-op when already finished.
+    void step();
+
+    void run_to_completion() {
+        while (!finished()) step();
+    }
+};
+
 template <typename Context>
 struct RpcEnvironment {
     static_assert(std::is_base_of_v<RpcContext<Context>, Context>, "Context must derive from RpcContext<Context>");
@@ -194,6 +234,11 @@ struct RpcEnvironment {
     Context context;
     std::unordered_map<std::string, RpcValue> variables;
     std::unordered_map<std::string, RpcFunc> registry;
+
+    // Pending executions driven by tick(). execute() bypasses this queue
+    // and runs synchronously; submit() appends to it for one-command-per-tick
+    // driving (e.g. Unreal Engine FAutomationLatentCommand::Update()).
+    std::deque<RpcExecution<Context>> pending;
 
     RpcEnvironment() { context.register_rpc_functions(*this); }
 
@@ -211,31 +256,70 @@ struct RpcEnvironment {
         };
     }
 
+    // Run a parsed script to completion immediately, in the calling thread.
+    // This is the synchronous, all-at-once mode and preserves the original
+    // execute() behavior. It does not interact with the tick() queue.
     template <size_t N>
     void execute(const ParsedScript<N>& script) {
-        for (const auto& cmd : script.commands) {
-            if (cmd.func_name.empty()) continue;
+        RpcExecution<Context>(this, script.commands.data(), script.commands.size())
+            .run_to_completion();
+    }
 
-            auto it = registry.find(std::string(cmd.func_name));
-            if (it == registry.end()) throw std::runtime_error("Unknown function: " + std::string(cmd.func_name));
+    // Queue a parsed script for tick-driven execution. Nothing runs until
+    // tick() is called. The script's storage must outlive its execution;
+    // ParsedScript<N> produced by the parse_and_execute macro is typically
+    // a `static constexpr`, which satisfies this naturally.
+    template <size_t N>
+    void submit(const ParsedScript<N>& script) {
+        RpcExecution<Context> exec(this, script.commands.data(), script.commands.size());
+        if (!exec.finished()) pending.push_back(std::move(exec));
+    }
 
-            std::array<RpcValue, 8> resolved_args;
-            for (size_t i = 0; i < cmd.arg_count; ++i) {
-                const auto& arg = cmd.args[i];
-                if (arg.type == ConstexprArg::Type::Int) resolved_args[i] = arg.i_val;
-                else if (arg.type == ConstexprArg::Type::Float) resolved_args[i] = arg.f_val;
-                else if (arg.type == ConstexprArg::Type::String) resolved_args[i] = std::string(arg.str_val);
-                else if (arg.type == ConstexprArg::Type::Variable) {
-                    std::string var_name(arg.str_val);
-                    if (variables.find(var_name) == variables.end()) throw std::runtime_error("Unknown variable: " + var_name);
-                    resolved_args[i] = variables.at(var_name);
-                }
+    // Advance the queued executions by exactly one command. Returns true
+    // while work remains pending after this tick, false once the queue is
+    // drained — chosen so UE FAutomationLatentCommand::Update() can write
+    // `return !env.tick();`. Exceptions thrown by an RPC propagate out;
+    // the offending execution is dropped from the queue.
+    bool tick() {
+        if (pending.empty()) return false;
+        auto& front = pending.front();
+        try {
+            if (!front.finished()) front.step();
+        } catch (...) {
+            pending.pop_front();
+            throw;
+        }
+        if (front.finished()) pending.pop_front();
+        return !pending.empty();
+    }
+
+    // True when no tick-driven work remains.
+    bool idle() const { return pending.empty(); }
+
+    // Executes a single parsed command against this environment. Used by
+    // RpcExecution::step(); also safe to call directly.
+    void execute_command(const Command& cmd) {
+        if (cmd.func_name.empty()) return;
+
+        auto it = registry.find(std::string(cmd.func_name));
+        if (it == registry.end()) throw std::runtime_error("Unknown function: " + std::string(cmd.func_name));
+
+        std::array<RpcValue, 8> resolved_args;
+        for (size_t i = 0; i < cmd.arg_count; ++i) {
+            const auto& arg = cmd.args[i];
+            if (arg.type == ConstexprArg::Type::Int) resolved_args[i] = arg.i_val;
+            else if (arg.type == ConstexprArg::Type::Float) resolved_args[i] = arg.f_val;
+            else if (arg.type == ConstexprArg::Type::String) resolved_args[i] = std::string(arg.str_val);
+            else if (arg.type == ConstexprArg::Type::Variable) {
+                std::string var_name(arg.str_val);
+                if (variables.find(var_name) == variables.end()) throw std::runtime_error("Unknown variable: " + var_name);
+                resolved_args[i] = variables.at(var_name);
             }
+        }
 
-            RpcValue result = it->second(resolved_args, cmd.arg_count);
-            if (!cmd.assigned_var.empty()) {
-                variables[std::string(cmd.assigned_var)] = result;
-            }
+        RpcValue result = it->second(resolved_args, cmd.arg_count);
+        if (!cmd.assigned_var.empty()) {
+            variables[std::string(cmd.assigned_var)] = result;
         }
     }
 
@@ -259,5 +343,14 @@ private:
         }
     }
 };
+
+// Out-of-line: needs the complete RpcEnvironment type.
+template <typename Context>
+void RpcExecution<Context>::step() {
+    // Skip blank entries that the parser may leave between real commands.
+    while (pc < size && commands[pc].func_name.empty()) ++pc;
+    if (pc >= size) return;
+    env->execute_command(commands[pc++]);
+}
 
 } // namespace rpc_dsl
