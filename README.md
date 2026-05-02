@@ -138,6 +138,38 @@ while (env.tick()) {
 env.execute(ast);
 ```
 
+### Appending steps while a script is in flight
+
+`submit()` always appends to the back of the pending queue, so you can
+push more RPC steps onto the environment at any time — between ticks,
+during `execute()`, or even from inside an RPC handler that is itself
+being driven by `tick()`. The in-flight script keeps draining first;
+the appended scripts run after it, in submission order.
+
+```cpp
+env.parse_and_submit(R"(
+    OpenAsset("Map")
+    SelectActor("Player")
+)");
+
+env.tick();                       // OpenAsset runs
+
+// Streaming: more work just arrived. Push it onto the queue —
+// SelectActor still runs next, then the appended commands.
+env.parse_and_submit(R"(
+    Translate(10, 0, 0)
+    Save()
+)");
+
+while (env.tick()) { /* engine tick */ }
+```
+
+The same applies when the appender is an RPC handler reached through
+`tick()` (for example, an `OnAssetLoaded` callback queueing the next
+step). The pending queue is a `std::deque`, whose `push_back` does not
+invalidate references to existing elements, so the in-flight execution
+remains valid for the rest of the current tick.
+
 ## Runtime parsing
 
 The same `execute()` and `submit()` entry points also accept a

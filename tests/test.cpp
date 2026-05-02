@@ -316,6 +316,132 @@ TEST_CASE("Runtime parser surfaces syntax errors as runtime exceptions") {
     CHECK_THROWS_AS(env.execute(std::string_view{bad}), std::logic_error);
 }
 
+// --- Appending steps to an in-flight execution ---
+//
+// Demonstrates that scripts can be pushed onto the pending queue while
+// another script is mid-drain. Because tick() drains the front execution
+// to completion before moving on, and `std::deque::push_back` does not
+// invalidate references to existing elements, additional submit() calls
+// — even from inside an RPC handler invoked by tick() — append cleanly
+// to the back of the queue and run after the in-flight script finishes.
+
+TEST_CASE("submit() between ticks appends commands to the live queue") {
+    rpc_dsl::RpcEnvironment<TestContext> env;
+
+    env.parse_and_submit(R"(
+        Spawn("first", 1)
+        Spawn("second", 2)
+    )");
+
+    // Drain the first command. The queue is still mid-flight.
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "first");
+    CHECK(env.idle() == false);
+
+    // Append more steps now, while execution is in progress. The new
+    // script lands at the *back* of the pending queue, so the in-flight
+    // script keeps draining first.
+    env.parse_and_submit(R"(
+        Spawn("appended_a", 10)
+        Spawn("appended_b", 20)
+    )");
+
+    // Finish draining the original script.
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "second");
+
+    // Then the appended script runs in submission order.
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "appended_a");
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "appended_b");
+    CHECK(env.context.calls == 4);
+    CHECK(env.idle() == true);
+
+    // Append again after the queue has fully drained — this is the
+    // streaming use case where new commands arrive at any time.
+    env.parse_and_submit(R"(
+        Spawn("late", 99)
+    )");
+    CHECK(env.idle() == false);
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "late");
+    CHECK(env.context.calls == 5);
+    CHECK(env.idle() == true);
+}
+
+// Context that can re-enter submit() from within an RPC handler. This
+// covers the trickier case where new commands are appended *while*
+// tick() is mid-step. tick() holds a reference to the front execution
+// across step(); std::deque::push_back is documented not to invalidate
+// references to existing elements, so the in-flight execution is safe.
+struct AppenderContext : public rpc_dsl::RpcContext<AppenderContext> {
+    rpc_dsl::RpcEnvironment<AppenderContext>* env_ptr = nullptr;
+    int calls = 0;
+    std::string last_name = "";
+    bool appended = false;
+
+    void register_rpc_functions(rpc_dsl::RpcEnvironment<AppenderContext>& env) override {
+        env.bind("Note", &AppenderContext::Note);
+        env.bind("AppendThenNote", &AppenderContext::AppendThenNote);
+    }
+
+    void Note(std::string name) {
+        calls++;
+        last_name = name;
+    }
+
+    // Pushes a follow-up script onto the pending queue from inside an
+    // RPC handler. This simulates "I learned about more work I need to
+    // do while running" — e.g. an asset load triggering a follow-up
+    // editor command sequence.
+    void AppendThenNote(std::string name) {
+        if (!appended && env_ptr) {
+            appended = true;
+            env_ptr->parse_and_submit(R"(
+                Note("from_handler_a")
+                Note("from_handler_b")
+            )");
+        }
+        calls++;
+        last_name = name;
+    }
+};
+
+TEST_CASE("submit() from inside an RPC handler appends to the queue") {
+    rpc_dsl::RpcEnvironment<AppenderContext> env;
+    env.context.env_ptr = &env;
+
+    env.parse_and_submit(R"(
+        AppendThenNote("trigger")
+        Note("after_trigger")
+    )");
+
+    // First tick runs AppendThenNote, which submits a follow-up script
+    // mid-step. The follow-up must land at the back of the queue, after
+    // the still-in-flight script.
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "trigger");
+    CHECK(env.context.appended == true);
+    CHECK(env.idle() == false);
+
+    // The original script's remaining command runs next, before the
+    // appended one — FIFO ordering must hold even when the appender is
+    // an RPC handler reached via tick().
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "after_trigger");
+
+    // Now the appended script drains.
+    CHECK(env.tick() == true);
+    CHECK(env.context.last_name == "from_handler_a");
+
+    CHECK(env.tick() == false);
+    CHECK(env.context.last_name == "from_handler_b");
+    CHECK(env.context.calls == 4);
+    CHECK(env.idle() == true);
+}
+
 // --- Regression: compile-time parsing must remain compile-time ---
 //
 // These static_asserts prove that scripts passed as string literals are
